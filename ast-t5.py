@@ -1,23 +1,35 @@
 import os
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, TrainingArguments, Trainer
-
 from datasets import Dataset, DatasetDict
 from sklearn.model_selection import train_test_split
 import tree_sitter
 from tree_sitter import Language, Parser
+import torch
+from tqdm import tqdm
+from evaluate import load
 
+# -------------------------------
+# Tree-sitter Parser Initialization
+# -------------------------------
+
+# Build the Tree-sitter Rust language parser library
 Language.build_library(
     'build/my-languages.so',
     ['tree-sitter-rust']
 )
 RUST_LANGUAGE = Language('build/my-languages.so', 'rust')
 
+# Initialize the parser for Rust language
 parser = Parser()
 parser.set_language(RUST_LANGUAGE)
 
 
-### AST Construction ###
+# -------------------------------
+# AST Construction Function
+# -------------------------------
+
 def code_to_ast(code_snippet):
+    """Convert a Rust code snippet to its AST representation."""
     tree = parser.parse(bytes(code_snippet, "utf-8"))
     root_node = tree.root_node
 
@@ -30,9 +42,13 @@ def code_to_ast(code_snippet):
 
     return traverse(root_node)
 
-preprocessed_code_path = "rust_processed.txt"
+
+# -------------------------------
+# Dataset Preprocessing Function
+# -------------------------------
 
 def preprocess_ast_dataset(file_path, num_lines=20, tokenizer=None):
+    """Preprocess the dataset by generating ASTs for input code snippets."""
     inputs = []
     targets = []
     
@@ -49,6 +65,7 @@ def preprocess_ast_dataset(file_path, num_lines=20, tokenizer=None):
                 inputs.append(input_ast)
                 targets.append(target_snippet)
     
+    # Tokenize inputs and targets
     tokenized_data = {
         "input_ids": tokenizer(inputs, max_length=512, truncation=True, padding="max_length")["input_ids"],
         "attention_mask": tokenizer(inputs, max_length=512, truncation=True, padding="max_length")["attention_mask"],
@@ -58,13 +75,18 @@ def preprocess_ast_dataset(file_path, num_lines=20, tokenizer=None):
     return tokenized_data
 
 
+# -------------------------------
+# Model Initialization
+# -------------------------------
 
-### Model ###
 tokenizer = AutoTokenizer.from_pretrained("gonglinyuan/ast_t5_base", trust_remote_code=True)
 model = AutoModelForSeq2SeqLM.from_pretrained("gonglinyuan/ast_t5_base", trust_remote_code=True)
 
+# Preprocess the dataset
+preprocessed_code_path = "rust_processed.txt"
 data = preprocess_ast_dataset(preprocessed_code_path, num_lines=3, tokenizer=tokenizer)
 
+# Split the dataset into training and validation sets
 train_inputs, val_inputs, train_targets, val_targets = train_test_split(
     data["input_ids"], data["labels"], test_size=0.2, random_state=42
 )
@@ -73,6 +95,7 @@ train_attention_masks, val_attention_masks = train_test_split(
     data["attention_mask"], test_size=0.2, random_state=42
 )
 
+# Create Hugging Face datasets for training and validation
 train_dataset = Dataset.from_dict({
     "input_ids": train_inputs,
     "attention_mask": train_attention_masks,
@@ -86,6 +109,10 @@ val_dataset = Dataset.from_dict({
 })
 
 dataset = DatasetDict({"train": train_dataset, "validation": val_dataset})
+
+# -------------------------------
+# Training Arguments
+# -------------------------------
 
 training_args = TrainingArguments(
     output_dir="./ast-t5-results",
@@ -102,6 +129,7 @@ training_args = TrainingArguments(
     report_to="none",
 )
 
+# Initialize the Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -109,17 +137,21 @@ trainer = Trainer(
     eval_dataset=dataset["validation"],
 )
 
+# Train the model
 trainer.train()
 
+# Save the fine-tuned model and tokenizer
 save_directory = "./fine-tuned-AST-T5"
 trainer.save_model(save_directory)
 tokenizer.save_pretrained(save_directory)
 
 
-### Evaluation ###
-
+# -------------------------------
+# Evaluation Function
+# -------------------------------
 
 def evaluate_model(model, tokenizer, eval_dataset, max_length=50):
+    """Evaluate the model on the validation dataset using BLEU, CodeBLEU, and ROUGE metrics."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
@@ -129,7 +161,7 @@ def evaluate_model(model, tokenizer, eval_dataset, max_length=50):
 
     print("Starting evaluation...")
     for i, example in enumerate(tqdm(eval_dataset)):
-        # Skip invalid or short inputs
+        # Skip short inputs
         if len(example["input_ids"]) < 5:
             print(f"Skipping example {i+1} due to short input.")
             continue
@@ -146,15 +178,6 @@ def evaluate_model(model, tokenizer, eval_dataset, max_length=50):
         predicted_code = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
         reference_code = tokenizer.decode(example["labels"], skip_special_tokens=True).strip()
 
-        if not predicted_code or not reference_code:
-            print(f"Skipping example {i+1} due to null or empty output.")
-            continue
-
-        print(f"Example {i+1}:")
-        print(f"Generated Code: {predicted_code}")
-        print(f"Reference Code: {reference_code}")
-        print("-" * 50)
-
         predictions.append(predicted_code)
         references.append(reference_code)
 
@@ -162,20 +185,17 @@ def evaluate_model(model, tokenizer, eval_dataset, max_length=50):
         print("No valid predictions were generated. Check the model or input dataset.")
         return {}
 
-    bleu_predictions = [pred.split() for pred in predictions]
-    bleu_references = [[ref.split()] for ref in references]
-
+    # Load evaluation metrics
     bleu = load("bleu")
-    rouge = load("rouge")
+    codebleu = load("codebleu")  # Ensure the 'codebleu' package is installed
 
-    bleu_score = bleu.compute(predictions=bleu_predictions, references=bleu_references)
-    rouge_score = rouge.compute(predictions=predictions, references=references)
+    # Compute BLEU, ROUGE, and CodeBLEU scores
+    bleu_score = bleu.compute(predictions=predictions, references=references)
+    codebleu_score = codebleu.compute(predictions=predictions, references=references)
 
-    return {"BLEU": bleu_score, "ROUGE": rouge_score}
+    return {"BLEU": bleu_score, "CodeBLEU": codebleu_score}
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
 
+# Perform evaluation and print metrics
 metrics = evaluate_model(model, tokenizer, val_dataset)
 print("Evaluation Metrics:", metrics)
-
